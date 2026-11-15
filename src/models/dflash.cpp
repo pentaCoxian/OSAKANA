@@ -145,7 +145,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         if (n_embd % hparams.dflash_conv_group_size != 0) {
             throw std::runtime_error("DFlash2 hidden size must be divisible by conv_group_size");
         }
-        if (n_embd < hparams.dflash_selector_top_k * (hparams.dflash_selector_top_k + 1)) {
+        const int64_t top_k = hparams.dflash_selector_top_k;
+        if (top_k > n_embd / (top_k + 1)) {
             throw std::runtime_error("DFlash2 hidden size is too small for the selector lattice");
         }
 
@@ -497,6 +498,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t row_used   = top_k + top_k * top_k;
 
     ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
+    ggml_set_name(candidates, "dflash2_candidates");
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);

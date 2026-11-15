@@ -898,7 +898,7 @@ static bool common_sampler_greedy_eligible(const common_sampler * gsmpl, bool wi
         return env && atoi(env) != 0;
     }();
     const auto & p = gsmpl->params;
-    if (disabled || !(p.temp <= 0.0f) || p.mirostat != 0 || p.n_probs > 0 || !p.logit_bias.empty() || (gsmpl->grmr && !with_grammar)) {
+    if (disabled || !(p.temp <= 0.0f) || p.dynatemp_range > 0.0f || p.mirostat != 0 || p.n_probs > 0 || !p.logit_bias.empty() || (gsmpl->grmr && !with_grammar)) {
         return false;
     }
     if (p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f)) {
@@ -910,12 +910,15 @@ static bool common_sampler_greedy_eligible(const common_sampler * gsmpl, bool wi
     if (p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f) {
         return false;
     }
+    bool has_temperature = false;
     for (const auto s : p.samplers) {
-        if (s == COMMON_SAMPLER_TYPE_INFILL || s == COMMON_SAMPLER_TYPE_ADAPTIVE_P) {
+        if (s == COMMON_SAMPLER_TYPE_INFILL || s == COMMON_SAMPLER_TYPE_ADAPTIVE_P ||
+                (s == COMMON_SAMPLER_TYPE_TYPICAL_P && p.typ_p < 1.0f)) {
             return false;
         }
+        has_temperature |= s == COMMON_SAMPLER_TYPE_TEMPERATURE;
     }
-    return true;
+    return has_temperature;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
@@ -1020,7 +1023,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 // ties go to the smaller id, as the scan of the full array does
                 const auto before = [&](llama_token a, llama_token b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); };
                 size_t n_done = 0;
-                for (const size_t n_top : { (size_t) 32, (size_t) 1024 }) {
+                for (const size_t limit : { (size_t) 32, (size_t) 1024 }) {
+                    const size_t n_top = std::min(limit, order.size());
+                    if (n_top == n_done) {
+                        break;
+                    }
                     std::partial_sort(order.begin() + n_done, order.begin() + n_top, order.end(), before);
                     top.resize(n_top - n_done);
                     for (size_t i = n_done; i < n_top; ++i) { top[i - n_done] = llama_token_data{ order[i], logits[order[i]], 0.0f }; }

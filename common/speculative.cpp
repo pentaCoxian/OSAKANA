@@ -1152,6 +1152,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 p = *end ? end + 1 : end;
             }
             std::sort(tree_sizes.begin(), tree_sizes.end());
+            // the tree keeps 64-bit candidate masks and arrays of 64 candidates
+            if (selector_top_k > 64 && !tree_sizes.empty()) {
+                SPC_WRN("tree drafts need selector_top_k <= 64, got %d: using chain drafts\n", selector_top_k);
+                tree_sizes.clear();
+            }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 

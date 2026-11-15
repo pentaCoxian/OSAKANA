@@ -29,7 +29,8 @@ ts = list(R.tensors) + idx
 for t in ts:
     W.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
 W.write_header_to_file(); W.write_kv_data_to_file(); W.write_ti_data_to_file()
-for t in ts:
-    W.write_tensor_data(t.data, tensor_endianess=R.endianess)
+for reader, tensors in ((R, R.tensors), (Q, idx)):
+    for t in tensors:
+        W.write_tensor_data(t.data, tensor_endianess=reader.endianess)
 W.close()
 print("wrote", out, len(ts), "tensors, keys", KEYS)

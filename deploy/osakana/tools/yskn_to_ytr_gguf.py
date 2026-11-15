@@ -77,7 +77,7 @@ def build(mm, t, rmap, cmap):
 def decode_ytr(b):
     """read a YTR tensor the way ytr.cu does; returns float32 [rows, cols] in GGUF order"""
     flat = b.reshape(-1)
-    magic, K, flags, rows, cols, lut_o, sc_o, sin_o, sout_o, rm_o, cm_o, code_o = struct.unpack_from("<IHHII7I", flat.tobytes()[:64])
+    magic, K, flags, rows, cols, lut_o, sc_o, sin_o, sout_o, rm_o, cm_o, code_o = struct.unpack_from("<IHHII7I", flat)
     assert magic == MAGIC
     seqs, wps = cols // 256, 4 * K
     lut = torch.from_numpy(np.frombuffer(flat, "<f2", 8192, lut_o).astype(np.float32)).view(4096, 2)

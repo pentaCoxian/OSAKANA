@@ -77,6 +77,9 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    void update_raw_ring(uint32_t cell0, bool follows) const;
+    bool raw_ring_needs_dense(uint32_t n_kv) const;
+
     // Pooled indexer keys, one F32 row per block of `ratio` cells (row n_blocks is a
     // scratch row), kept up to date incrementally while blk_valid holds. blk_valid means a
     // single sequence written in order, every cell holding the token of the same rank (for
@@ -136,6 +139,7 @@ private:
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
     uint32_t blk_ratio = 0;
+    mutable int64_t raw_ring_end = 0;
     mutable bool blk_valid = true;
     mutable bool blk_rebuild = false;   // [blk-rebuild] valid, but the pooled rows are stale until the next ubatch re-pools them
     mutable uint32_t blk_rebuild_tries = 0;   // [blk-rebuild2] see get_blk_rebuild_tries()
@@ -184,6 +188,7 @@ public:
     // the pooled block-key cache and whether the current ubatch may use / must update it
     llama_kv_cache * get_blk() const;
     bool blk_ok() const;
+    bool raw_ring_needs_dense(uint32_t n_kv) const;
 
     // [blk-rebuild] the current ubatch must re-pool every block, not only the ones it touches (decided in apply())
     bool blk_rebuild() const { return blk_rebuild_cur; }

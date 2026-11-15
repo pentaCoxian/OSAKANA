@@ -192,6 +192,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
     // an empty cache is trivially laid out by position; blocks are rebuilt as they fill
     blk_valid = true;
+    raw_ring_end = 0;
     blk_rebuild = false;   // [blk-rebuild] nothing left to rebuild
     blk_rebuild_tries = 0; // [blk-rebuild2]
 }
@@ -220,7 +221,36 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         blk_rebuild_tries = 0; // [blk-rebuild2]
     }
 
+    if (res && mem_idx && mem_idx->store_rows > 0 && mem_idx->get_cells(0).get_used() == 0) {
+        raw_ring_end = 0;
+    }
+
     return res;
+}
+
+void llama_memory_hybrid_idx::update_raw_ring(uint32_t cell0, bool follows) const {
+    const uint32_t ring = mem_idx ? mem_idx->store_rows : 0;
+    if (ring == 0) {
+        return;
+    }
+
+    // A partial checkpoint restores recurrent state, but cannot restore overwritten raw keys.
+    raw_ring_end = std::max(raw_ring_end, (int64_t) mem_idx->get_cells(0).used_max_p1());
+    if (!blk_valid || !follows || blk_ratio == 0) {
+        return;
+    }
+    const int64_t r = blk_ratio;
+    const auto * recr = get_mem_recr();
+    const int64_t back = recr->tree ? ((int64_t) recr->n_rs_seq + 1 + r - 1)/r : 0;
+    const int64_t first = std::max<int64_t>(0, (int64_t) cell0/r - back)*r;
+    if (first < std::max<int64_t>(0, raw_ring_end - ring)) {
+        QSA_BLK_INVALIDATE("raw ring rewind");
+    }
+}
+
+bool llama_memory_hybrid_idx::raw_ring_needs_dense(uint32_t n_kv) const {
+    const uint32_t ring = mem_idx ? mem_idx->store_rows : 0;
+    return ring > 0 && (n_kv > ring || raw_ring_end > ring);
 }
 
 llama_pos llama_memory_hybrid_idx::seq_pos_min(llama_seq_id seq_id) const {
@@ -912,6 +942,10 @@ bool llama_memory_hybrid_idx_context::apply() {
         res = res & ctx_idx->apply();
     }
 
+    if (res && mem && ctx_idx && get_idx()->has_ubatch()) {
+        mem->update_raw_ring(get_idx()->ubatch_cell0(), get_idx()->ubatch_cells_follow());
+    }
+
     // [blk-rebuild] the cells of this ubatch are in place now, so blk_ok() can say whether the pooled cache is usable for it;
     // if it is and a rebuild is pending, this ubatch re-pools every block
     blk_rebuild_cur = mem && mem->get_blk_rebuild() && blk_ok();
@@ -948,6 +982,10 @@ bool llama_memory_hybrid_idx_context::blk_ok() const {
         return false;
     }
     return true;
+}
+
+bool llama_memory_hybrid_idx_context::raw_ring_needs_dense(uint32_t n_kv) const {
+    return mem && mem->raw_ring_needs_dense(n_kv);
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {

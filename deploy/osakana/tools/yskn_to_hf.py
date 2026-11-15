@@ -13,14 +13,16 @@ SHARD_BYTES = 5 << 30
 
 
 def mulberry_signs(seed, offset, n):
-    s = (seed * 7919 + 13) & 0xFFFFFFFF or 0x9E3779B9; out = np.empty(n, np.float32); M = 0xFFFFFFFF
-    for k in range(offset + n):
-        s = (s + 0x6D2B79F5) & M; t = s
-        t = ((t ^ (t >> 15)) * (t | 1)) & M
-        t ^= (t + (((t ^ (t >> 7)) * (t | 61)) & M)) & M
-        t ^= t >> 14
-        if k >= offset: out[k - offset] = -1.0 if t < 0x80000000 else 1.0
-    return torch.from_numpy(out)
+    if offset < 0 or n < 0:
+        raise ValueError("sign offset and count must be non-negative")
+    s = (seed * 7919 + 13) & 0xFFFFFFFF or 0x9E3779B9
+    # The state advances by a constant, so skip the unused prefix before mixing.
+    s = np.uint32((s + offset * 0x6D2B79F5) & 0xFFFFFFFF)
+    states = s + (np.arange(n, dtype=np.uint32) + np.uint32(1)) * np.uint32(0x6D2B79F5)
+    t = (states ^ (states >> 15)) * (states | np.uint32(1))
+    t ^= t + ((t ^ (t >> 7)) * (t | np.uint32(61)))
+    t ^= t >> 14
+    return torch.from_numpy(np.where(t < 0x80000000, -1.0, 1.0).astype(np.float32))
 
 
 def signs(rot, n):

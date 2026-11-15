@@ -460,7 +460,7 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
 
         auto * hybrid = model.arch == LLM_ARCH_QWEN35 ? dynamic_cast<llama_memory_hybrid *>(memory.get()) : nullptr;
-        if (hybrid != nullptr) {
+        if (hybrid != nullptr && cparams.spec_tree) {
             hybrid->get_mem_attn()->tree = &spec_tree;
             hybrid->get_mem_recr()->tree = &spec_tree;
         } else {

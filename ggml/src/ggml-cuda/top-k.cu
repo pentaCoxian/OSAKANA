@@ -177,30 +177,7 @@ static __global__ void top_k_radix_gather(
     }
 }
 
-// gather of every column whose key is at least the k-th key: rows of `cap` >= k entries (prefilled with -1), the columns above
-// the k-th key first, then all that tie with it as far as the row has room. In any order, but the set does not depend on timing.
-template<int BLOCK_SIZE>
-static __global__ void top_k_radix_gather_ties(const float * src, int * dst, top_k_radix_state * states, int ncols, int k, int cap,
-                                               int blocks_per_row) {
-    const int row = blockIdx.x / blocks_per_row;
-    const int row_block = blockIdx.x % blocks_per_row;
-    const float * row_src = src + (size_t) row * ncols;
-    int * row_dst = dst + (size_t) row * cap;
-    top_k_radix_state * state = &states[row];
-    for (int col = row_block * BLOCK_SIZE + threadIdx.x; col < ncols; col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > state->prefix) {
-            row_dst[atomicAdd(&state->greater_count, 1)] = col;
-        } else if (key == state->prefix) {
-            const int pos = k - state->rank + atomicAdd(&state->equal_count, 1);
-            if (pos < cap) {
-                row_dst[pos] = col;
-            }
-        }
-    }
-}
-
-// [topk-det] deterministic gather (GGML_CUDA_TOPK_DET=1): columns in ascending order, ties at the k-th key by lowest index
+// Prefix sums retain the lowest column indices when ties exceed the output capacity.
 template<int NT>
 static __device__ __forceinline__ int2 top_k_det_scan2(int a, int b, int2 & total) {
     __shared__ int2 warp_sums[NT/32];
@@ -249,17 +226,19 @@ static __global__ void top_k_radix_gather_det(
         int * __restrict__ dst,
         const top_k_radix_state * __restrict__ states,
         int ncols,
-        int k) {
+        int k,
+        int cap) {
     const int row = blockIdx.x;
     const float * row_src = src + (size_t) row * ncols;
-    int * row_dst = dst + (size_t) row * k;
+    int * row_dst = dst + (size_t) row * cap;
     const uint32_t prefix = states[row].prefix;
     const int      rank   = states[row].rank;
     const int      n_gt   = k - rank;
+    const int      n_eq   = cap - n_gt;
 
     int gbase = 0;
     int ebase = 0;
-    for (int t0 = 0; t0 < ncols && (gbase < n_gt || ebase < rank); t0 += NT) {
+    for (int t0 = 0; t0 < ncols && (gbase < n_gt || ebase < n_eq); t0 += NT) {
         const int  col = t0 + threadIdx.x;
         const bool in  = col < ncols;
         const uint32_t key = in ? top_k_float_to_ordered(row_src[col]) : 0u;
@@ -269,7 +248,7 @@ static __global__ void top_k_radix_gather_det(
         const int2 off = top_k_det_scan2<NT>(g, e, total);
         if (g) {
             row_dst[gbase + off.x] = col;
-        } else if (e && ebase + off.y < rank) {
+        } else if (e && ebase + off.y < n_eq) {
             row_dst[n_gt + ebase + off.y] = col;
         }
         gbase += total.x;
@@ -399,11 +378,11 @@ static void top_k_radix_cuda(
         }
         static const bool det = [] { const char * e = getenv("GGML_CUDA_TOPK_DET"); return e && atoi(e) != 0; }(); // [topk-det]
         if (ties_cap > 0) {
-            top_k_radix_gather_ties<BLOCK_SIZE><<<row_grid, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k, ties_cap, blocks_per_row);
+            top_k_radix_gather_det<1024><<<nrows, 1024, 0, stream>>>(src, dst, states, ncols, k, ties_cap);
             return;
         }
         if (det) {
-            top_k_radix_gather_det<1024><<<nrows, 1024, 0, stream>>>(src, dst, states, ncols, k);
+            top_k_radix_gather_det<1024><<<nrows, 1024, 0, stream>>>(src, dst, states, ncols, k, k);
             return;
         }
         top_k_radix_gather<BLOCK_SIZE>

@@ -88,11 +88,24 @@ void ggml_cuda_ytr_prepare(const ggml_cgraph * cgraph) {
         }
         ytr_info inf;
         ytr_header & h = inf.h;
+        const size_t nbytes = ggml_nbytes(src0);
+        GGML_ASSERT(nbytes >= sizeof(h));
         CUDA_CHECK(cudaMemcpy(&h, src0->data, sizeof(h), cudaMemcpyDeviceToHost));
         GGML_ASSERT(h.magic == YTR_MAGIC && "YTR tensor without header");
         GGML_ASSERT((int64_t) h.rows == src0->ne[1] && (int64_t) h.cols == src0->ne[0]);
         GGML_ASSERT((h.bits == 6 && src0->type == GGML_TYPE_YTR3) || (h.bits == 8 && src0->type == GGML_TYPE_YTR4));
-        GGML_ASSERT(h.cols % 512 == 0 && h.cols <= YTR_CMAX && h.rows % 128 == 0 && (!(h.flags & 3) || (h.rows % 512 == 0 && h.rows <= YTR_RMAX)));
+        GGML_ASSERT((h.flags & ~31u) == 0 && (h.flags & 24) != 24);
+        GGML_ASSERT(h.cols > 0 && h.cols % 512 == 0 && h.cols <= YTR_CMAX && h.rows > 0 && h.rows % 128 == 0 && (!(h.flags & 3) || (h.rows % 512 == 0 && h.rows <= YTR_RMAX)));
+        const auto check_range = [&](uint32_t off, uint64_t bytes, size_t align) {
+            GGML_ASSERT(off >= sizeof(h) && off % align == 0 && off <= nbytes && bytes <= nbytes - off);
+        };
+        check_range(h.lut_off, 16384, sizeof(half2));
+        check_range(h.scale_off, (uint64_t) h.rows * sizeof(half), sizeof(half));
+        check_range(h.sin_off, h.cols / 8, sizeof(uint4));
+        check_range(h.code_off, (uint64_t) h.rows * (h.cols / 256) * 16 * h.bits, sizeof(uint4));
+        if (h.flags & 1) { check_range(h.sout_off, h.rows / 8, sizeof(uint4)); }
+        if (h.flags & 2) { check_range(h.rmap_off, (uint64_t) h.rows * sizeof(int32_t), sizeof(int32_t)); }
+        if (h.flags & 4) { check_range(h.cmap_off, (uint64_t) h.cols * sizeof(int32_t), sizeof(int32_t)); }
         std::vector<uint8_t> sin(h.cols / 8);
         CUDA_CHECK(cudaMemcpy(sin.data(), (const uint8_t *) src0->data + h.sin_off, sin.size(), cudaMemcpyDeviceToHost));
         uint64_t key = 1469598103934665603ull ^ h.cols;
@@ -103,14 +116,16 @@ void ggml_cuda_ytr_prepare(const ggml_cgraph * cgraph) {
             std::vector<int32_t> cmap(h.cols);
             CUDA_CHECK(cudaMemcpy(cmap.data(), (const uint8_t *) src0->data + h.cmap_off, cmap.size() * 4, cudaMemcpyDeviceToHost));
             for (int32_t c : cmap) {
+                GGML_ASSERT(c >= 0 && (uint32_t) c < h.cols);
                 key = (key ^ (uint32_t) c) * 1099511628211ull;
             }
         }
         inf.in_key = key;
         if (h.flags & 2) {
-            std::vector<int32_t> rmap(h.rows), rinv(h.rows);
+            std::vector<int32_t> rmap(h.rows), rinv(h.rows, -1);
             CUDA_CHECK(cudaMemcpy(rmap.data(), (const uint8_t *) src0->data + h.rmap_off, rmap.size() * 4, cudaMemcpyDeviceToHost));
             for (uint32_t r = 0; r < h.rows; ++r) {
+                GGML_ASSERT(rmap[r] >= 0 && (uint32_t) rmap[r] < h.rows && rinv[rmap[r]] == -1);
                 rinv[rmap[r]] = (int32_t) r;
             }
             CUDA_CHECK(cudaMalloc(&inf.rinv, h.rows * sizeof(int)));
@@ -290,41 +305,9 @@ static void ytr_mul_mat_ref(ggml_backend_cuda_context & ctx, const ytr_header & 
 
 // ---- fast path ---------------------------------------------------------------------------------------------------------------
 
-template <int K>
-static __device__ __forceinline__ uint32_t ytr_state(const uint32_t * w, const int j) {
-    const int e = K * (j + 1);
-    if (e < 12) {
-        return (w[0] & ((1u << e) - 1u)) << (12 - e);
-    }
-    const int start = e - 12, word = start >> 5, sh = start & 31;
-    uint32_t v = w[word] >> sh;
-    if (sh > 20) {
-        v |= w[word + 1] << (32 - sh);
-    }
-    return v & 0xFFFu;
-}
-
 static __device__ __forceinline__ void ytr_mma(float * c, const uint32_t * a, const uint32_t * b) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
-// shift a code stream right by sh bits (sh may be negative: zeros come in below bit 0)
-template <int NW>
-static __device__ __forceinline__ void ytr_shift(uint32_t * u, const int sh) {
-    if (sh >= 0) {
-#pragma unroll
-        for (int w = 0; w < NW - 1; ++w) {
-            u[w] = __funnelshift_r(u[w], u[w + 1], sh);
-        }
-        u[NW - 1] >>= sh;
-    } else {
-#pragma unroll
-        for (int w = NW - 1; w > 0; --w) {
-            u[w] = __funnelshift_l(u[w - 1], u[w], -sh);
-        }
-        u[0] <<= -sh;
-    }
 }
 
 // byte offset (index * 4) into the code table of the 12-bit window at a compile-time bit position
@@ -2158,11 +2141,17 @@ static bool ytr_shead_get(const int V, const int H) {
         FILE * f = path ? fopen(path, "rb") : nullptr;
         if (f) {
             struct { char magic[4]; uint32_t V, H, R; uint64_t off[5]; } hd;
-            if (fread(&hd, sizeof(hd), 1, f) == 1 && memcmp(hd.magic, "YSH1", 4) == 0 && hd.R == YSH_R && hd.V % 128 == 0 && hd.H % 512 == 0 && hd.H <= 24 * 256) {
+            if (fread(&hd, sizeof(hd), 1, f) == 1 && memcmp(hd.magic, "YSH1", 4) == 0 && hd.R == YSH_R &&
+                    hd.V == (uint32_t) V && hd.H == (uint32_t) H && hd.V >= YSH_MK && hd.V % 128 == 0 && hd.H > 0 && hd.H % 512 == 0 && hd.H <= 24 * 256) {
                 const size_t sz[5] = { (size_t) hd.R * hd.H * 4, (size_t) hd.V * 4, (size_t) hd.V * hd.R, (size_t) hd.V * 4, (size_t) hd.V * hd.H };
-                void * dev[5];
+                void * dev[5] = {};
                 std::vector<char> buf;
-                bool ok = true;
+                bool ok = fseek(f, 0, SEEK_END) == 0;
+                const long file_size = ok ? ftell(f) : -1;
+                ok = file_size >= 0;
+                for (int i = 0; ok && i < 5; ++i) {
+                    ok = hd.off[i] >= 64 && hd.off[i] <= (uint64_t) file_size && sz[i] <= (uint64_t) file_size - hd.off[i];
+                }
                 for (int i = 0; ok && i < 5; ++i) {
                     buf.resize(sz[i]);
                     ok = fseek(f, (long) hd.off[i], SEEK_SET) == 0 && fread(buf.data(), 1, sz[i], f) == sz[i];
@@ -2185,6 +2174,12 @@ static bool ytr_shead_get(const int V, const int H) {
                     CUDA_CHECK(cudaMalloc(&g_ysh.unary, 16 * 32 * sizeof(float)));
                     g_ysh.ok = true;
                     GGML_LOG_INFO("%s: shortlist head %s: %u rows, rank %u\n", __func__, path, hd.V, hd.R);
+                } else {
+                    for (void * p : dev) {
+                        if (p != nullptr) {
+                            CUDA_CHECK(cudaFree(p));
+                        }
+                    }
                 }
             }
             fclose(f);
@@ -2203,7 +2198,7 @@ static bool ytr_shead_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
     ggml_tensor * node = cgraph->nodes[i];
     const ggml_tensor * x = node->src[1];
     const int n_tok = (int) x->ne[1];
-    if ((inf.h.flags & 3) || n_tok > 16 || !ytr_shead_get((int) inf.h.rows, (int) inf.h.cols)) {
+    if ((inf.h.flags & 3) || n_tok > 16) {
         return false;
     }
     const ggml_tensor * topk = nullptr, * resh = nullptr, * rows = nullptr, * amax = nullptr;
@@ -2227,12 +2222,15 @@ static bool ytr_shead_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
             return false;   // another reader of the logits
         }
     }
-    if (topk == nullptr || rows == nullptr || ggml_node_get_use_count(cgraph, i) != n_use) {
+    if (topk == nullptr || rows == nullptr || strcmp(topk->name, "dflash2_candidates") != 0 || ggml_node_get_use_count(cgraph, i) != n_use) {
         return false;
     }
     const int k = (int) topk->ne[0];
     if (k < 1 || k > 32 || topk->ne[1] != n_tok || topk->type != GGML_TYPE_I32 || rows->type != GGML_TYPE_F32 || !ggml_is_contiguous(topk) ||
             !ggml_is_contiguous(rows) || ggml_nelements(rows) != (int64_t) k * n_tok || resh->ne[0] != 1 || resh->ne[1] != inf.h.rows) {
+        return false;
+    }
+    if (!ytr_shead_get((int) inf.h.rows, (int) inf.h.cols)) {
         return false;
     }
     cudaStream_t stream = ctx.stream();

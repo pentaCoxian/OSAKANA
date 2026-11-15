@@ -797,13 +797,14 @@ class qsa27b_input : public llm_graph_input_i {
 public:
     const llama_memory_hybrid_idx_context * mctx;
     int64_t nkv, nq, ratio;
+    const bool raw_ring_dense;
     ggml_tensor * key_ids = nullptr;
     ggml_tensor * token_blocks = nullptr;
     ggml_tensor * block_pos = nullptr;
     ggml_tensor * bias = nullptr;
     ggml_tensor * query_block = nullptr;
 
-    qsa27b_input(const llama_memory_hybrid_idx_context * m, int64_t k, int64_t q, int64_t r) : mctx(m), nkv(k), nq(q), ratio(r) {}
+    qsa27b_input(const llama_memory_hybrid_idx_context * m, int64_t k, int64_t q, int64_t r) : mctx(m), nkv(k), nq(q), ratio(r), raw_ring_dense(m->raw_ring_needs_dense(k)) {}
 
     void set_input(const llama_ubatch * ub) override {
         mctx->get_idx()->set_input_k_idxs(key_ids, ub);
@@ -832,7 +833,8 @@ public:
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
         const bool fast = !getenv("LLAMA_QSA27B_REFERENCE") && params.cparams.flash_attn && mctx->blk_ok() &&
                 (mctx->get_idx()->ubatch_cell0() + 1)/ratio > params.hparams.indexer_top_k/ratio;
-        return !fast && params.cparams.qsa_enabled && params.ubatch.n_tokens == nq && mctx->get_idx()->get_n_kv() == nkv;
+        return !fast && params.cparams.qsa_enabled && params.ubatch.n_tokens == nq && mctx->get_idx()->get_n_kv() == nkv &&
+               raw_ring_dense == mctx->raw_ring_needs_dense(nkv);
     }
 };
 
@@ -866,11 +868,11 @@ ggml_tensor * llama_model_qwen35::graph::build_qsa_mask(llm_graph_input_attn_kv 
     raw = ggml_reshape_3d(ctx0, raw, d, 1, n_tokens);
     ggml_build_forward_expand(gf, idx->cpy_k(ctx0, raw, input->key_ids, il));
     if (!nb || nkv <= hparams.indexer_top_k) { return attn->get_kq_mask(); }
-    // [qsa-raw-ring] this path scores every block from its raw keys; with a ring only the newest are stored. Attend densely then.
-    if (const int64_t ring = llama_kv_cache_raw_ring_rows(); ring > 0 && nkv > ring) {
+    // Wrapped raw storage may have lost prefix keys even after nkv shrinks below the ring size.
+    if (input->raw_ring_dense) {
         static bool warned = false;
         if (!warned) {
-            LLAMA_LOG_WARN("%s: the pooled block cache is not usable and the raw keys are a ring of %lld rows: dense attention for this batch\n", __func__, (long long) ring);
+            LLAMA_LOG_WARN("%s: the pooled block cache is not usable and the raw ring no longer holds every key: dense attention for this batch\n", __func__);
             warned = true;
         }
         return attn->get_kq_mask();

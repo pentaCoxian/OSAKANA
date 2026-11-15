@@ -5156,11 +5156,21 @@ static void ggml_compute_forward_get_rows_ytr(
 
     const uint8_t * base = (const uint8_t *) src0->data;
     uint32_t h[16];
+    const size_t nbytes = ggml_nbytes(src0);
+    GGML_ASSERT(nbytes >= sizeof(h));
     memcpy(h, base, sizeof(h));
     const int     K     = h[1] & 0xFFFF;
     const int     flags = h[1] >> 16;
     const int64_t cols  = h[3];
-    GGML_ASSERT(h[0] == 0x31525459u && (flags & 15) == 0 && cols == ne00 && (int64_t) h[2] == ne01 && cols % 512 == 0);
+    GGML_ASSERT(h[0] == 0x31525459u && flags == 0 && cols == ne00 && (int64_t) h[2] == ne01 && cols > 0 && cols % 512 == 0);
+    GGML_ASSERT((K == 6 && src0->type == GGML_TYPE_YTR3) || (K == 8 && src0->type == GGML_TYPE_YTR4));
+    const auto check_range = [&](uint32_t off, uint64_t bytes, size_t align) {
+        GGML_ASSERT(off >= sizeof(h) && off % align == 0 && off <= nbytes && bytes <= nbytes - off);
+    };
+    check_range(h[4], 16384, sizeof(ggml_fp16_t));
+    check_range(h[5], (uint64_t) h[2] * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+    check_range(h[6], cols / 8, 1);
+    check_range(h[10], (uint64_t) h[2] * (cols / 256) * 16 * K, sizeof(uint32_t));
     const ggml_fp16_t * lut   = (const ggml_fp16_t *) (base + h[4]);
     const ggml_fp16_t * scale = (const ggml_fp16_t *) (base + h[5]);
     const uint8_t *     sin   = base + h[6];
